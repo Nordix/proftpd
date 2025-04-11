@@ -30,6 +30,8 @@
 
 #define MOD_LDAP_VERSION	"mod_ldap/2.9.5"
 
+#define USER_CACHE_SIZE   10
+
 #if PROFTPD_VERSION_NUMBER < 0x0001030103
 # error MOD_LDAP_VERSION " requires ProFTPD 1.3.4rc1 or later"
 #endif
@@ -182,6 +184,12 @@ struct sasl_info {
   const char *realm;
 };
 
+struct ldap_user_cache_entry {
+  char* basedn;
+  char* filter;
+  struct passwd* pw;
+};
+
 static array_header *ldap_servers = NULL;
 static struct server_info *curr_server_info = NULL;
 static unsigned int curr_server_index = 0;
@@ -228,6 +236,7 @@ static gid_t ldap_defaultgid = -1;
 static LDAP *ld = NULL;
 static array_header *cached_quota = NULL;
 static array_header *cached_ssh_pubkeys = NULL;
+static array_header *cached_users = NULL;
 
 /* Necessary prototypes */
 static int ldap_sess_init(void);
@@ -809,6 +818,18 @@ static struct passwd *pr_ldap_user_lookup(pool *p, char *filter_template,
     return NULL;
   }
 
+  if (cached_users != NULL && cached_users->nelts > 0) {
+    for (int i=0; i<cached_users->nelts; i++){
+      struct ldap_user_cache_entry user_entry = ((struct ldap_user_cache_entry *) cached_users->elts)[i];
+
+      if (!strcmp(user_entry.basedn, basedn) && !strcmp(user_entry.filter, filter)){
+        (void) pr_log_writefile(ldap_logfd, MOD_LDAP_VERSION,
+          "Using cached entry for %s", basedn);
+          return user_entry.pw;
+      }
+    }
+  }
+
   result = pr_ldap_search(basedn, filter, attrs, 2, TRUE);
   if (result == NULL) {
     return NULL;
@@ -1154,6 +1175,15 @@ static struct passwd *pr_ldap_user_lookup(pool *p, char *filter_template,
     "found user %s, UID %s, GID %s, homedir %s, shell %s",
     pw->pw_name, pr_uid2str(p, pw->pw_uid), pr_gid2str(p, pw->pw_gid),
     pw->pw_dir, pw->pw_shell);
+
+  struct ldap_user_cache_entry user;
+  user.basedn = strdup(basedn);
+  user.filter = filter;
+  user.pw = pw;
+
+  struct ldap_user_cache_entry *user_entry = push_array(cached_users);
+  *user_entry = user;
+
   return pw;
 }
 
@@ -3476,6 +3506,8 @@ static int ldap_sess_init(void) {
 
   ldap_pool = make_sub_pool(session.pool);
   pr_pool_tag(ldap_pool, MOD_LDAP_VERSION);
+
+  cached_users = make_array(session.pool, USER_CACHE_SIZE, sizeof(struct ldap_user_cache_entry));
 
   c = find_config(main_server->conf, CONF_PARAM, "LDAPLog", FALSE);
   if (c != NULL) {
